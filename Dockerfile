@@ -1,11 +1,17 @@
 # Версия «после оптимизации». Сравнение с Dockerfile.v1 — в REPORT.md.
 #
-# Стадия build: здесь живёт uv и всё, что нужно для установки зависимостей.
-# Рантайм: чистый python:3.12-slim-bookworm, в него переезжает только готовый .venv.
-# База у обеих стадий общая (образ uv собран поверх python:3.12-slim-bookworm),
-# поэтому интерпретатор внутри .venv указывает на существующий путь.
+# Обе стадии стоят на одной и той же базе python:3.14-slim (Debian trixie).
+# uv не является базовым образом: он копируется одним файлом в стадию build
+# и в рантайм не попадает.
+#
+# Почему именно python:3.14-slim, а не python:3.12-slim-bookworm:
+# у bookworm-варианта 19 MB унаследованных потерь по dive (в основном двойной
+# /usr/bin/perl), у trixie-варианта — 5.7 MB. Разбор в REPORT.md, раздел 6.
 
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS build
+FROM python:3.14-slim AS build
+
+# uv приезжает как один статический бинарь, без своего базового образа.
+COPY --from=ghcr.io/astral-sh/uv:0.9.9 /uv /bin/uv
 
 # UV_COMPILE_BYTECODE — разложить .pyc заранее, чтобы не писать их в слой записи
 # контейнера при первом запуске. UV_LINK_MODE=copy — не делать hardlink на кеш,
@@ -22,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim
 
 RUN useradd --create-home --uid 10001 appuser
 
