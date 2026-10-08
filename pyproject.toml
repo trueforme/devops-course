@@ -1,0 +1,14 @@
+[project]
+name = "docker-notes-app"
+version = "0.1.0"
+description = "Заметки в PostgreSQL и счётчик посещений в Redis поверх FastAPI"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.120.4",
+    "uvicorn==0.38.0",
+    "psycopg[binary]==3.2.12",
+    "redis==6.4.0",
+]
+
+[tool.uv]
+package = false

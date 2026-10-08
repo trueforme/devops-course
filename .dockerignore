@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+.env
+.check
+backup
+nginx
+compose*.yaml
+Dockerfile*
+*.md
