@@ -17,8 +17,8 @@ storage driver `overlay2`, dive 0.13.1, git 2.43.0, uv (локально, для
 | 1 | Базовый стек, healthcheck, порядок запуска  | готово    |
 | 2 | Том БД и сохранность данных                 | готово    |
 | 3 | Холодный бэкап и восстановление             | готово    |
-| 4 | Изоляция сетей                              | не начато |
-| 5 | Переменные, `.env`, имя проекта, `down -v`  | не начато |
+| 4 | Изоляция сетей                              | готово    |
+| 5 | Переменные, `.env`, имя проекта, `down -v`  | готово    |
 | 6 | dive до и после оптимизации                 | готово    |
 | 7 | * Автоприменение кода (`override` / `watch`)| не начато |
 | 8 | * dive в GitHub Actions                     | не начато |
@@ -496,11 +496,519 @@ $ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At \
 
 ## 4. Изоляция сетей
 
-*Не начато.*
+### 4.1. Топология
+
+```yaml
+networks:
+  front:
+  back:
+```
+
+| Сеть    | Подсеть         | Участники                |
+|---------|-----------------|--------------------------|
+| `front` | `172.21.0.0/16` | `web`, `app`             |
+| `back`  | `172.22.0.0/16` | `app`, `db`, `cache`     |
+
+```bash
+$ docker network inspect notes-app_front --format '{{range .Containers}}{{.Name}} {{end}}'
+notes-app-app-1 notes-app-web-1
+$ docker network inspect notes-app_back --format '{{range .Containers}}{{.Name}} {{end}}'
+notes-app-app-1 notes-app-db-1 notes-app-cache-1
+```
+
+`app` — единственный сервис в обеих сетях. Входной `web` к `back` **не подключён**;
+изоляция не обходится ради прохождения проверок.
+
+### 4.2. Публикуется только входной сервис
+
+```bash
+$ docker compose ps --format 'table {{.Service}}\t{{.Ports}}'
+SERVICE   PORTS
+app       8000/tcp
+cache     6379/tcp
+db        5432/tcp
+web       0.0.0.0:18080->80/tcp, [::]:18080->80/tcp
+```
+
+У `app`, `db` и `cache` указан только внутренний порт — маппинга на хост нет.
+
+### 4.3. Из Nginx: DNS-имени БД не существует
+
+```bash
+$ docker compose exec web sh -c 'getent hosts db || echo "db: имя НЕ найдено"'
+db: имя НЕ найдено
+$ docker compose exec web sh -c 'getent hosts cache || echo "cache: имя НЕ найдено"'
+cache: имя НЕ найдено
+```
+
+Встроенный DNS Compose отвечает только про контейнеры **общей** сети. У `web`
+и `db` общей сети нет, поэтому имя не резолвится вообще — это не отказ
+в доступе, а отсутствие записи.
+
+### 4.4. Из Nginx: прямое TCP по IP тоже отвергается
+
+DNS можно обойти, подключившись по адресу. Проверено и это:
+
+```bash
+$ docker compose exec web sh -c 'nc -z -w3 172.22.0.3 5432 && echo OK || echo "отказ/таймаут, код $?"'
+отказ/таймаут, код 1
+
+$ docker compose exec web sh -c 'nc -z -w3 172.22.0.2 6379 && echo OK || echo "отказ/таймаут, код $?"'
+отказ/таймаут, код 1
+```
+
+Причина видна в интерфейсах:
+
+```bash
+$ docker compose exec web sh -c 'ip -o -4 addr show'
+lo   127.0.0.1/8
+eth0 172.21.0.3/16        ← только front, интерфейса в back нет
+```
+
+### 4.5. Из приложения: доступ есть
+
+```bash
+$ docker compose exec app python -c "
+import socket
+for host,port in (('db',5432),('cache',6379)):
+    s=socket.create_connection((host,port),3); print(f'TCP {host}:{port} -> {s.getpeername()} OK'); s.close()"
+TCP db:5432 -> ('172.22.0.3', 5432) OK
+TCP cache:6379 -> ('172.22.0.2', 6379) OK
+```
+
+И на прикладном уровне:
+
+```bash
+$ docker compose exec app python -c "
+import os,psycopg,redis
+with psycopg.connect(host='db',dbname=os.environ['POSTGRES_DB'],
+                     user=os.environ['POSTGRES_USER'],
+                     password=os.environ['POSTGRES_PASSWORD']) as c:
+    print('PostgreSQL:', c.execute('select count(*) from notes').fetchone()[0], 'заметок')
+print('Redis PING:', redis.Redis(host='cache').ping())"
+PostgreSQL: 2 заметок
+Redis PING: True
+```
+
+### 4.6. Почему `app` в двух сетях не становится IP-маршрутизатором
+
+Вопрос задания. Напрашивающийся ответ — «в контейнере выключена пересылка
+пакетов» — **неверен**:
+
+```bash
+$ docker compose exec app cat /proc/sys/net/ipv4/ip_forward
+1
+$ cat /proc/sys/net/ipv4/ip_forward
+1
+```
+
+Пересылка включена и в контейнере, и на хосте. Настоящих причин две,
+и они независимы.
+
+**Причина первая: на `app` никто не маршрутизирует.**
+
+Адреса `app`:
+
+```bash
+$ docker inspect notes-app-app-1 --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} -> {{$v.IPAddress}}{{println}}{{end}}'
+notes-app_back  -> 172.22.0.4
+notes-app_front -> 172.21.0.2
+```
+
+Таблица маршрутов `web` и решение ядра для пакета к БД:
+
+```bash
+$ docker compose exec web sh -c 'ip route; ip route get 172.22.0.3'
+default via 172.21.0.1 dev eth0
+172.21.0.0/16 dev eth0 scope link src 172.21.0.3
+---
+172.22.0.3 via 172.21.0.1 dev eth0  src 172.21.0.3
+```
+
+Пакет уходит на `172.21.0.1`. Это **не `app`** (у него во `front` адрес
+`172.21.0.2`), а шлюз сети — интерфейс моста на хосте:
+
+```bash
+$ ip -o -4 addr show | grep -E '172\.2[12]\.'
+br-54a5dc31f036 172.21.0.1/16     ← шлюз front
+br-012df8ff82d3 172.22.0.1/16     ← шлюз back
+```
+
+У `web` нет ни маршрута `172.22.0.0/16 via 172.21.0.2`, ни причин его завести.
+**Маршрутизатором становятся не по факту наличия двух интерфейсов, а потому что
+кто-то указал тебя следующим узлом.** Отсутствие маршрута — не запрет, а отсутствие
+действия: никто не настраивал `app` шлюзом и не объявлял через него маршруты.
+
+**Причина вторая: хост не пересылает трафик между мостами.**
+
+Пакет доходит до хоста, у которого есть интерфейсы в обеих сетях и включён
+`ip_forward`. Технически он мог бы переслать его в `back`. Не пересылает,
+потому что Docker устанавливает правила изоляции (цепочки
+`DOCKER-ISOLATION-STAGE-1/2`), отбрасывающие трафик между разными
+bridge-сетями. Эмпирическое подтверждение — таймаут `nc` из 4.4.
+
+**Что делает `app`.** Он не передаёт чужие пакеты, а **инициирует собственные
+соединения** с адресов `172.21.0.2` и `172.22.0.4` соответственно. Для `web`
+он обычный HTTP-сервер во `front`; для `db` — обычный клиент в `back`.
+Два интерфейса дают ему две роли, а не функцию шлюза между ними.
+
+### 4.7. Граница изоляции: с хоста БД доступна
+
+Честная оговорка, без которой картина неполна:
+
+```bash
+$ nc -z -w3 172.22.0.3 5432
+Connection to 172.22.0.3 5432 port [tcp/postgresql] succeeded!
+```
+
+С **хоста** база доступна напрямую по внутреннему адресу, хотя её порт не
+опубликован. Причина не в ошибке конфигурации: хост имеет интерфейс
+`br-012df8ff82d3` с адресом `172.22.0.1/16` в сети `back`, то есть находится
+в ней и маршрутизирует туда напрямую, без пересылки между мостами.
+
+Что это означает на практике:
+
+- отсутствие `ports:` защищает от **внешней сети** и от **других
+  compose-сетей**, но не от процессов на самом хосте Docker;
+- «не опубликован» не равно «недоступен» — равно «недоступен снаружи хоста».
+
+Для учебного стенда это приемлемо. В рабочей среде доступ к хосту Docker
+и так равносилен доступу ко всем контейнерам, поэтому отдельной меры здесь
+не требуется — важно лишь не считать неопубликованный порт самостоятельной
+границей безопасности.
+
+---
 
 ## 5. Переменные, `.env`, имя проекта, `down` против `down -v`
 
-*Не начато.*
+### 5.1. Изменяемые значения вынесены в переменные
+
+```yaml
+web:
+  ports:
+    - "${WEB_PORT:-18080}:80"
+app:
+  environment:
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+```
+
+Синтаксис `${WEB_PORT:-18080}` задаёт значение по умолчанию: стек поднимется
+даже без `.env`, но с паролем БД такой трюк намеренно не используется —
+отсутствие пароля должно быть ошибкой, а не молча подставленным значением.
+
+### 5.2. `.env.example` в Git, рабочий `.env` исключён
+
+`.env.example` (отслеживается Git):
+
+```bash
+POSTGRES_DB=notes
+POSTGRES_USER=notes_user
+POSTGRES_PASSWORD=change_me_locally
+WEB_PORT=18080
+```
+
+Значения валидные, но демонстративно временные: `change_me_locally` очевидно
+требует замены и не является ничьим настоящим паролем.
+
+> **Честная оговорка.** На этом стенде рабочий `.env` получен простым
+> `cp .env.example .env`, то есть пароль в нём совпадает с примером. Для
+> одноразового локального стенда без опубликованного порта БД это приемлемо;
+> в любой общей среде значение обязано отличаться. Почему смена пароля
+> не сводится к правке `.env` — см. 5.8.
+
+`.gitignore`:
+
+```bash
+.env
+.check/
+backup/
+__pycache__/
+*.py[cod]
+.venv/
+```
+
+Проверка, что рабочий файл действительно не попадает в репозиторий:
+
+```bash
+$ git ls-files --error-unmatch .env 2>/dev/null || echo "нет, исключён"
+нет, исключён
+$ git check-ignore -v .env
+.gitignore:2:.env	.env
+```
+
+`backup/` исключён отдельно: там лежит архив с реальными данными БД (6.8 MB),
+ему не место в истории репозитория.
+
+### 5.3. Итог `docker compose config`
+
+Пароли вырезаны из отчётного вывода (`sed -E 's/(PASSWORD): .*/\1: «вырезано»/'`).
+**Сама команда печатает их в открытом виде** — это и есть её назначение:
+показать итоговую конфигурацию после всех подстановок.
+
+```yaml
+name: notes-app
+services:
+  app:
+    build:
+      context: /home/trueforme/devops/docker-notes-app
+      dockerfile: Dockerfile
+    depends_on:
+      cache:
+        condition: service_healthy
+        required: true
+      db:
+        condition: service_healthy
+        required: true
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      POSTGRES_DB: notes
+      POSTGRES_PASSWORD: «вырезано»
+      POSTGRES_USER: notes_user
+      REDIS_HOST: cache
+      REDIS_PORT: "6379"
+    mem_limit: "268435456"
+    networks:
+      back: null
+      front: null
+  db:
+    environment:
+      POSTGRES_DB: notes
+      POSTGRES_PASSWORD: «вырезано»
+      POSTGRES_USER: notes_user
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 2s
+      retries: 15
+      start_period: 3s
+    image: postgres:18
+    networks:
+      back: null
+    volumes:
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql
+```
+
+Видно, что `mem_limit: 256m` развернулся в `"268435456"`, а `${POSTGRES_DB}`
+подставился значением из `.env`.
+
+### 5.4. Разовая подмена переменной
+
+```bash
+$ WEB_PORT=18081 docker compose up -d --wait web
+$ curl -fsS localhost:18081/
+Docker notes app - visits: 1
+$ docker compose ps web --format '{{.Ports}}'
+0.0.0.0:18081->80/tcp, [::]:18081->80/tcp
+```
+
+Но переменная живёт **только один вызов команды**:
+
+```bash
+$ docker compose up -d --wait web          # уже без WEB_PORT
+$ docker compose ps web --format '{{.Ports}}'
+0.0.0.0:18080->80/tcp, [::]:18080->80/tcp  ← вернулось значение из .env
+$ curl -o /dev/null -w '%{http_code}' --max-time 3 localhost:18081/
+000
+```
+
+Следующий `up` пересоздал контейнер по `.env`. Чтобы изменение было постоянным,
+правят `.env`, а не окружение команды.
+
+### 5.5. Источник имени проекта и его приоритет
+
+```bash
+$ docker compose config --format json | jq -r .name
+notes-app
+$ docker compose -p notes-app-cli config --format json | jq -r .name
+notes-app-cli
+$ COMPOSE_PROJECT_NAME=notes-app-env docker compose config --format json | jq -r .name
+notes-app-env
+$ sed '/^name:/d' compose.yaml > .check/no-name.yaml
+$ docker compose --project-directory . -f .check/no-name.yaml config --format json | jq -r .name
+docker-notes-app
+```
+
+| Приоритет | Источник                     | Результат          |
+|-----------|------------------------------|--------------------|
+| 1 (высший)| флаг `-p` / `--project-name` | `notes-app-cli`    |
+| 2         | `COMPOSE_PROJECT_NAME`       | `notes-app-env`    |
+| 3         | поле `name:` в `compose.yaml`| `notes-app`        |
+| 4 (низший)| имя каталога                 | `docker-notes-app` |
+
+Верхняя строка проверена прямым конфликтом:
+
+```bash
+$ COMPOSE_PROJECT_NAME=from-env docker compose -p from-cli config --format json | jq -r .name
+from-cli
+```
+
+В проекте задано поле `name: notes-app` — без него именем стало бы
+`docker-notes-app` (имя каталога), и переименование папки меняло бы имена
+всех ресурсов.
+
+### 5.6. Имена контейнеров, сетей и томов
+
+Имя проекта — префикс всего:
+
+```bash
+$ docker compose ps --format 'table {{.Name}}\t{{.Service}}'
+NAME                SERVICE
+notes-app-app-1     app
+notes-app-cache-1   cache
+notes-app-db-1      db
+notes-app-web-1     web
+
+$ docker network ls --filter name=^notes-app_ --format 'table {{.Name}}\t{{.Driver}}'
+NAME              DRIVER
+notes-app_back    bridge
+notes-app_front   bridge
+
+$ docker volume ls --filter name=^notes-app_ --format 'table {{.Name}}'
+VOLUME NAME
+notes-app_pgdata
+```
+
+Правила именования:
+
+| Ресурс    | Шаблон                        | Пример              |
+|-----------|-------------------------------|---------------------|
+| Контейнер | `<проект>-<сервис>-<номер>`   | `notes-app-db-1`    |
+| Сеть      | `<проект>_<имя сети>`         | `notes-app_back`    |
+| Том       | `<проект>_<имя тома>`         | `notes-app_pgdata`  |
+
+Номер в имени контейнера — порядковый для масштабирования (`--scale`).
+Разделитель различается: дефис у контейнеров, подчёркивание у сетей и томов.
+
+**Практическое следствие: одинаковое имя проекта = общие ресурсы.** Два стека,
+запущенные с одним именем, будут управлять одними и теми же контейнерами
+и томом. Поэтому имя задано явно полем `name:`, а не оставлено на усмотрение
+имени каталога.
+
+### 5.7. `down` против `down -v`
+
+Демонстрация выполнена на данных собственного стенда, восстановимых из архива
+раздела 3.
+
+**A. `docker compose down` — том сохраняется:**
+
+```bash
+$ curl -fsS localhost:18080/notes
+1: контрольная заметка
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+
+$ docker compose down            # в выводе нет ни одной строки про volume
+$ docker volume ls --filter name=^notes-app_pgdata$ --format '{{.Name}}'
+notes-app_pgdata                 ← том на месте
+
+$ docker compose up -d --wait && curl -fsS localhost:18080/notes
+1: контрольная заметка
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+**B. `docker compose down -v` — том удаляется:**
+
+```bash
+$ docker compose down -v
+ Volume notes-app_pgdata Removing
+ Volume notes-app_pgdata Removed
+
+$ docker volume ls --filter name=^notes-app_pgdata$ --format '{{.Name}}'
+                                 ← пусто
+
+$ docker compose up -d --wait && curl -fsS localhost:18080/notes
+(no notes)                       ← база инициализирована заново, пустая
+```
+
+| Команда     | Контейнеры | Сети | Именованные тома | Данные |
+|-------------|-----------|------|------------------|--------|
+| `down`      | удаляет   | удаляет | **сохраняет** | сохраняются |
+| `down -v`   | удаляет   | удаляет | **удаляет**   | **теряются** |
+
+**C. Восстановление после `down -v`:**
+
+```bash
+$ docker volume create notes-app_pgdata
+$ docker run --rm -v notes-app_pgdata:/data -v "$PWD/backup:/backup:ro" \
+    alpine:3.24 tar xzf /backup/pgdata-20261009-045944.tgz -C /data
+$ docker compose up -d --wait
+$ curl -fsS localhost:18080/notes
+1: контрольная заметка
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+Данные вернулись — это второе независимое подтверждение, что архив из раздела 3
+рабочий.
+
+`down -v` необратим: подтверждения он не спрашивает и выполняется мгновенно.
+Единственная защита — наличие проверенной резервной копии.
+
+### 5.8. Побочная находка: `POSTGRES_PASSWORD` не меняет пароль существующей БД
+
+При попытке привести рабочий `.env` в соответствие с 5.2 обнаружилось поведение,
+которое стоит зафиксировать отдельно.
+
+**Что сделано:** изменено значение в `.env` и выполнен `up`.
+
+```bash
+$ sed -i 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=<новое>/' .env
+$ docker compose up -d --wait
+dependency failed to start: container notes-app-app-1 is unhealthy
+
+$ curl -fsS localhost:18080/notes
+curl: (22) The requested URL returned error: 502
+```
+
+**Что в логах:**
+
+```text
+app-1 | psycopg.OperationalError: connection failed: ... FATAL:
+        password authentication failed for user "notes_user"
+app-1 | ERROR:    Application startup failed. Exiting.
+```
+
+**Причина.** `POSTGRES_PASSWORD` обрабатывается точкой входа образа **только при
+первичной инициализации кластера**, когда том пуст. Том уже существовал, initdb
+не запускался, и в базе остался прежний пароль. Переменная окружения и реальное
+состояние БД разошлись.
+
+**Самое интересное — состояние сервисов в этот момент:**
+
+```bash
+$ docker compose ps -a --format 'table {{.Service}}\t{{.Status}}'
+SERVICE   STATUS
+app       Restarting (3) 4 seconds ago
+cache     Up 2 minutes (healthy)
+db        Up 24 seconds (healthy)      ← «здорова»!
+web       Up 2 minutes
+```
+
+**`db` имеет статус `healthy`, хотя её единственный клиент не может войти.**
+Причина в том, что проверяет healthcheck:
+
+```bash
+$ docker compose exec db pg_isready -U notes_user -d notes
+/var/run/postgresql:5432 - accepting connections
+```
+
+`pg_isready` отвечает на вопрос «принимает ли сервер соединения», а не
+«работают ли учётные данные». Для задачи «дождаться запуска БД» этого достаточно
+и это правильный выбор. Но healthcheck в принципе не является проверкой того,
+что зависимый сервис сможет работать: `app` падал на аутентификации, пока `db`
+рапортовала о здоровье.
+
+**Правильное исправление** — менять пароль в самой БД (`ALTER USER ... WITH
+PASSWORD`) и синхронно в `.env`, а не только в `.env`. В данном прогоне эта
+команда не выполнялась: передача пароля аргументом командной строки оставляет
+его в истории шелла и в списке процессов. Для стенда значение возвращено
+к исходному.
+
+**Вывод для эксплуатации.** Смена пароля БД в compose-стеке — не правка
+переменной, а двухшаговая операция. Если забыть первый шаг, стек ломается
+в момент, когда `up` отрапортует об успешном запуске двух из четырёх сервисов.
 
 ## 6. dive до и после оптимизации
 
