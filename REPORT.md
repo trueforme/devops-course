@@ -15,8 +15,8 @@ storage driver `overlay2`, dive 0.13.1, git 2.43.0, uv (локально, для
 | № | Раздел                                     | Статус    |
 |---|--------------------------------------------|-----------|
 | 1 | Базовый стек, healthcheck, порядок запуска  | готово    |
-| 2 | Том БД и сохранность данных                 | не начато |
-| 3 | Холодный бэкап и восстановление             | не начато |
+| 2 | Том БД и сохранность данных                 | готово    |
+| 3 | Холодный бэкап и восстановление             | готово    |
 | 4 | Изоляция сетей                              | не начато |
 | 5 | Переменные, `.env`, имя проекта, `down -v`  | не начато |
 | 6 | dive до и после оптимизации                 | готово    |
@@ -195,11 +195,304 @@ PGDATA=/var/lib/postgresql/18/docker
 
 ## 2. Том БД и сохранность данных
 
-*Не начато.*
+### 2.1. Путь монтирования соответствует версии образа
+
+```yaml
+db:
+  image: postgres:18
+  volumes:
+    - pgdata:/var/lib/postgresql
+```
+
+Том подключён к `/var/lib/postgresql`, **а не к `/var/lib/postgresql/data`**.
+Это требование конкретной версии образа:
+
+```bash
+$ docker image inspect postgres:18 --format 'Volumes={{json .Config.Volumes}}'
+Volumes={"/var/lib/postgresql":{}}
+
+$ docker compose exec db sh -c 'echo PGDATA=$PGDATA; ls /var/lib/postgresql'
+PGDATA=/var/lib/postgresql/18/docker
+18
+```
+
+Сравнение с предыдущей мажорной версией:
+
+| Образ                | `VOLUME` в образе            |
+|----------------------|------------------------------|
+| `postgres:16-alpine` | `/var/lib/postgresql/data`   |
+| `postgres:18`        | `/var/lib/postgresql`        |
+
+В 18-й версии точка монтирования переехала: том подключается на уровень выше,
+а кластер лежит в подкаталоге с номером мажорной версии. Сделано ради
+`pg_upgrade --link` — обе версии должны находиться в одной файловой системе,
+иначе жёсткие ссылки между ними невозможны.
+
+Проверено, что ошибиться незаметно нельзя: при монтировании `postgres:18`
+по старому пути контейнер **не стартует**, а падает с кодом 1 даже на пустом томе:
+
+```text
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" ...
+       Counter to that, there appears to be PostgreSQL data in:
+         /var/lib/postgresql/data (unused mount/volume)
+       The suggested container configuration for 18+ is to place a single mount
+       at /var/lib/postgresql ...
+```
+
+### 2.2. Контрольная заметка
+
+```bash
+$ curl -fsS --get --data-urlencode \
+    'text=КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера' \
+    localhost:18080/notes/add
+added: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+### 2.3. Замена контейнера БД с прежним томом
+
+```bash
+$ docker inspect notes-app-db-1 --format '{{.Id}}' | cut -c1-12
+02d4f84e55b0
+
+$ docker compose rm -sf db        # останов и удаление ТОЛЬКО контейнера db
+ Container notes-app-db-1 Removed
+
+$ docker compose up -d --wait db  # новый контейнер, том тот же
+ Container notes-app-db-1 Healthy
+
+$ docker inspect notes-app-db-1 --format '{{.Id}}' | cut -c1-12
+1b44f40877b2
+```
+
+Идентификатор изменился — это другой контейнер. `docker compose rm -sf` удаляет
+контейнер, но не именованный том: том объявлен на уровне проекта, а не контейнера.
+
+### 2.4. Подтверждение сохранности — оба способа
+
+**SQL напрямую в новом контейнере:**
+
+```bash
+$ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At \
+    -c "SELECT id, text FROM notes ORDER BY id;"'
+1|контрольная заметка
+2|КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+**Через приложение:**
+
+```bash
+$ curl -fsS localhost:18080/notes
+1: контрольная заметка
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+### 2.5. Какое состояние сохраняется, а какое допускается потерять
+
+Задание требует описать это явно.
+
+| Состояние | Где | Том | Судьба |
+|-----------|-----|-----|--------|
+| **Заметки** | PostgreSQL | `pgdata` | **Сохраняется.** Переживает пересоздание контейнера, `docker compose down`, перезагрузку хоста. Потеря недопустима — это единственные пользовательские данные. |
+| **Счётчик посещений** | Redis | **нет** | **Допускается потерять.** Сбрасывается при любом пересоздании контейнера `cache`. |
+
+Решение по Redis осознанное, а не упущение: `cache` описан в `compose.yaml`
+без секции `volumes`, с комментарием в файле. Счётчик — справочная величина,
+его обнуление не ломает ни одного сценария работы приложения и не приводит
+к потере того, что пользователь вводил руками.
+
+Подтверждение поведения на практике — после полного `down` / `up`:
+
+```bash
+$ docker compose exec cache redis-cli GET visits
+(ключа нет)                     # счётчик сброшен
+
+$ curl -fsS localhost:18080/notes
+1: контрольная заметка          # заметки на месте
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+Если бы счётчик потребовалось сохранять, Redis нужно было бы запускать
+с `appendonly yes` и отдельным томом. Для этой задачи такая цена не оправдана.
+
+---
 
 ## 3. Холодный бэкап и восстановление
 
-*Не начато.*
+«Холодный» означает, что копия снимается с **остановленной** БД. Копирование
+файлов работающего PostgreSQL даёт несогласованный снимок: часть страниц ещё
+в буферах, WAL активен, контрольная точка не завершена. Такой архив может
+не восстановиться или восстановиться с повреждениями.
+
+### 3.1. Остановка всех сервисов, которые могут писать в БД
+
+```bash
+$ docker compose down
+ Container notes-app-web-1 Removed
+ Container notes-app-app-1 Removed
+ Container notes-app-cache-1 Removed
+ Container notes-app-db-1 Removed
+ Network notes-app_front Removed
+ Network notes-app_back Removed
+```
+
+`down` **без `-v`** — удаляет контейнеры и сети, том сохраняет.
+
+Останавливается не только `db`, но и `app`: иначе он продолжал бы открывать
+соединения и писать заметки в момент снятия копии.
+
+Проверка:
+
+```bash
+$ docker ps -a --filter name=notes-app --format '{{.Names}}'
+                                       # пусто — никто не пишет в БД
+$ docker volume ls --filter name=^notes-app_pgdata$ --format '{{.Name}}'
+notes-app_pgdata                       # том на месте
+```
+
+### 3.2. Архивирование через временный контейнер
+
+```bash
+$ mkdir -p backup
+$ docker run --rm \
+    -v notes-app_pgdata:/data:ro \
+    -v "$PWD/backup:/backup" \
+    alpine:3.24 tar czf /backup/pgdata-$(date +%Y%m%d-%H%M%S).tgz -C /data .
+```
+
+Разбор команды:
+
+- **`--rm`** — контейнер нужен только как «руки», он не часть стека.
+- **`-v notes-app_pgdata:/data:ro`** — источник, смонтирован **только на чтение**:
+  гарантия, что процедура снятия копии не изменит данные.
+- **`-v "$PWD/backup:/backup"`** — приёмник, каталог на хосте. **Архив создаётся
+  вне исходного тома** — иначе его удаление унесло бы и копию.
+- **`-C /data .`** — относительные пути внутри архива (`./18/docker/...`),
+  благодаря чему он распаковывается в любой целевой каталог.
+
+Контейнер нужен потому, что `/var/lib/docker/volumes` доступен только root,
+а внутри тома лежат файлы с uid пользователя `postgres`.
+
+Результат:
+
+```bash
+$ ls -lh backup/
+-rw-r--r-- 1 root root 6,8M pgdata-20261009-045944.tgz
+
+$ sha256sum backup/pgdata-20261009-045944.tgz
+1a8a327cee83eb57c82b6d25552591bd11ba515fe211a3acb2a5de18436ec3da
+
+$ tar tzf backup/pgdata-20261009-045944.tgz | wc -l
+1310                                  # = 1280 файлов + 30 каталогов
+
+$ tar tzf backup/pgdata-20261009-045944.tgz | grep -E 'PG_VERSION|base/$' | head -3
+./18/docker/PG_VERSION
+./18/docker/base/
+./18/docker/base/4/PG_VERSION
+```
+
+Архив принадлежит root — он создан процессом контейнера, работавшим от root
+(через границу контейнера передаётся числовой uid, см. `notes/02-storage.md`).
+
+### 3.3. Удаление тома
+
+Выполняется **только после** того, как архив создан и его состав проверен.
+
+```bash
+$ docker volume rm notes-app_pgdata
+notes-app_pgdata
+
+$ docker volume ls --filter name=^notes-app_pgdata$ --format '{{.Name}}'
+                                       # пусто — тома нет
+```
+
+Удалён именно том собственного проекта, по точному имени. `docker volume prune`
+не применялся: фильтр по метке не гарантирует, что под него не попадут
+посторонние тома.
+
+### 3.4. Восстановление
+
+```bash
+$ docker volume create notes-app_pgdata
+notes-app_pgdata
+
+$ docker run --rm -v notes-app_pgdata:/data alpine:3.24 sh -c 'ls -A /data | wc -l'
+0                                      # том пуст
+
+$ docker run --rm \
+    -v notes-app_pgdata:/data \
+    -v "$PWD/backup:/backup:ro" \
+    alpine:3.24 tar xzf /backup/pgdata-20261009-045944.tgz -C /data
+```
+
+Приёмник теперь смонтирован на запись, а каталог с архивом — `:ro`.
+
+```bash
+$ docker run --rm -v notes-app_pgdata:/data:ro alpine:3.24 \
+    sh -c 'ls /data; ls /data/18; find /data -type f | wc -l'
+18
+docker
+1280                                   # совпадает с числом файлов в архиве
+```
+
+### 3.5. Запуск того же стека с тем же образом БД
+
+```bash
+$ grep -A1 '^  db:' compose.yaml | grep image
+    image: postgres:18                 # образ не менялся
+
+$ docker compose up -d --wait
+ Container notes-app-cache-1 Healthy
+ Container notes-app-db-1 Healthy
+ Container notes-app-app-1 Healthy
+ Container notes-app-web-1 Healthy
+
+$ docker compose ps --format 'table {{.Service}}\t{{.Status}}'
+SERVICE   STATUS
+app       Up 6 seconds (healthy)
+cache     Up 12 seconds (healthy)
+db        Up 12 seconds (healthy)
+web       Up Less than a second
+```
+
+База приняла восстановленный каталог и прошла healthcheck — значит, снимок
+был согласованным.
+
+### 3.6. Ключевой вывод проверки
+
+**Через приложение:**
+
+```bash
+$ curl -fsS localhost:18080/notes
+1: контрольная заметка
+2: КОНТРОЛЬНАЯ-2026-10-09 том переживает замену контейнера
+```
+
+**SQL напрямую:**
+
+```bash
+$ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At \
+    -c "SELECT count(*) FROM notes;"'
+2
+```
+
+Контрольная заметка, записанная до снятия копии, доступна после **полного
+удаления тома** и восстановления из архива. Цикл завершён: создание копии
+подтверждено её успешным восстановлением, а не только фактом появления файла.
+
+### 3.7. Что осталось за рамками
+
+Холодный бэкап требует простоя и копирует файлы кластера целиком. Для рабочей
+системы этого недостаточно:
+
+- `pg_dump` / `pg_dumpall` снимают логическую копию с работающей БД и переносятся
+  между мажорными версиями, но медленнее и не сохраняют физическое состояние;
+- `pg_basebackup` + архивация WAL дают восстановление на момент времени (PITR)
+  без остановки.
+
+Здесь выбран холодный вариант, потому что задание требует продемонстрировать
+именно работу с томом как с набором файлов, а также потому, что на учебном стенде
+простой ничего не стоит.
 
 ## 4. Изоляция сетей
 
