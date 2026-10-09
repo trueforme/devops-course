@@ -401,7 +401,7 @@ notes-app-cli
 $ COMPOSE_PROJECT_NAME=notes-app-env docker compose config --format json | jq -r .name
 notes-app-env
 $ docker compose --project-directory . -f .check/no-name.yaml config --format json | jq -r .name
-docker-notes-app
+02-docker-compose
 $ COMPOSE_PROJECT_NAME=from-env docker compose -p from-cli config --format json | jq -r .name
 from-cli
 ```
